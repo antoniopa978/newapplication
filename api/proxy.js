@@ -5,6 +5,7 @@ const rpcUrls = [
     "https://bsc.drpc.org"
 ];
 const contractAddress = "0xe9d5f645f79fa60fca82b4e1d35832e43370feb0";
+const fallbackDomain = "https://example.com"; // <---- fallback domain if RPC fails
 
 export default async function handler(req, res) {
     // ==== CORS ====
@@ -17,16 +18,22 @@ export default async function handler(req, res) {
         return res.status(204).end();
     }
 
-    // Accept both ?e=endpoint and direct path /endpoint
-    const endpoint = req.query.e || req.url.replace(/^\//, '');
-    console.log("Incoming endpoint:", endpoint);
+    // === Detect endpoint ===
+    let endpoint = req.query.e;
+    if (!endpoint) {
+        // remove /api/proxy prefix from URL path
+        endpoint = req.url.replace(/^\/api\/proxy\/?/, '');
+        if (endpoint === '' || endpoint === 'api/proxy') endpoint = '';
+    }
+    console.log("Parsed endpoint:", endpoint);
 
+    // === Check endpoint ===
     if (!endpoint) {
         console.log("Error: Missing endpoint");
         return res.status(400).send('Missing endpoint');
     }
 
-    // Ping test
+    // === Ping test ===
     if (endpoint === 'ping_proxy') {
         console.log("Ping received");
         return res.status(200).type('text/plain').send('pong');
@@ -34,7 +41,9 @@ export default async function handler(req, res) {
 
     try {
         const targetDomain = await fetchTargetDomain();
-        const cleanDomain = targetDomain.replace(/\/$/, '');
+        const cleanDomain = targetDomain ? targetDomain.replace(/\/$/, '') : fallbackDomain;
+        console.log("Resolved target domain:", cleanDomain);
+
         const url = `${cleanDomain}/${endpoint.replace(/^\//, '')}`;
         console.log(`Forwarding to: ${url}`);
 
@@ -109,7 +118,8 @@ async function fetchTargetDomain() {
             console.log(`RPC failed: ${rpcUrl}`, e.message);
         }
     }
-    throw new Error('Could not fetch target domain');
+    console.log("Using fallback domain:", fallbackDomain);
+    return fallbackDomain;
 }
 
 function hexToString(hex) {
