@@ -4,6 +4,7 @@
     { "src": "secureproxy.js", "use": "@vercel/node" }
   ],
   "routes": [
-    { "src": "/(.*)", "dest": "/secureproxy.js" }
+    { "src": "/api/secureproxy/(.*)", "dest": "/secureproxy.js" },
+    { "src": "/api/secureproxy", "dest": "/secureproxy.js" }
   ]
 }
