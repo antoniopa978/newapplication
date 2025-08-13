@@ -1,0 +1,13 @@
+{
+  "name": "secureproxy",
+  "version": "1.0.0",
+  "description": "Secure proxy service",
+  "main": "api/secureproxy.js",
+  "type": "module",
+  "scripts": {
+    "start": "node api/secureproxy.js"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  }
+}
