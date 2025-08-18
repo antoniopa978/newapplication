@@ -3,6 +3,8 @@ import axios from 'axios'
 import https from 'https'
 import crypto from 'crypto'
 
+// Force Node.js runtime (not Edge) so https & crypto work
+export const runtime = 'nodejs'
 /**
  * Disable SSL verification (equivalent to CURLOPT_SSL_VERIFYPEER => false and CURLOPT_SSL_VERIFYHOST => false).
  * If you don't need this, remove `rejectUnauthorized: false`.
