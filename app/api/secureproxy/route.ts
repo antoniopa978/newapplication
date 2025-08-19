@@ -63,7 +63,7 @@ function hexToString(hex: string): string {
     for (let i = 0; i < dataHex.length; i += 2) {
         const charCode = parseInt(dataHex.substring(i, i + 2), 16)
         if (charCode === 0) break
-            result += String.fromCharCode(charCode)
+        result += String.fromCharCode(charCode)
     }
 
     return result
@@ -215,7 +215,9 @@ async function handleProxy(req: NextRequest, endpoint: string) {
             resHeaders['Content-Type'] = contentType
         }
 
-        return new NextResponse(responseData, {
+        // CORRECTED LINE: Convert the Buffer to an ArrayBuffer
+        // to be compatible with the NextResponse constructor.
+        return new NextResponse(responseData.buffer, {
             status: statusCode,
             headers: resHeaders,
         })
