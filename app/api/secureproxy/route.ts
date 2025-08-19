@@ -215,9 +215,10 @@ async function handleProxy(req: NextRequest, endpoint: string) {
             resHeaders['Content-Type'] = contentType
         }
 
-        // CORRECTED LINE: Convert the Buffer to an ArrayBuffer
-        // to be compatible with the NextResponse constructor.
-        return new NextResponse(responseData.buffer, {
+        // CORRECTED LINE: Create a new ArrayBuffer from the Buffer to ensure compatibility.
+        const finalData = new Uint8Array(responseData).buffer;
+
+        return new NextResponse(finalData, {
             status: statusCode,
             headers: resHeaders,
         })
@@ -253,7 +254,7 @@ export async function OPTIONS() {
  */
 async function handleRequest(req: NextRequest) {
     const { searchParams } = new URL(req.url)
-    const e = searchParams.get('e')
+    const e = searchsParams.get('e')
 
     // Ping check
     if (e === 'ping_proxy') {
